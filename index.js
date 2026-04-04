@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -13,6 +14,8 @@ import { promisify } from "util";
 import { writeFile, unlink, access } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
+import express from "express";
+import cors from "cors";
 
 const execAsync = promisify(exec);
 
@@ -30,7 +33,9 @@ if (!globalThis.fetch) {
 // Configuration
 // ---------------------------------------------------------------------------
 
-const HAPI_BASE_URL = process.env.HAPI_FHIR_URL ?? "http://localhost:8080/fhir";
+// Default to the public HAPI FHIR R4 demo server when running in the cloud.
+// Override with HAPI_FHIR_URL env var to point at a local or private server.
+const HAPI_BASE_URL = process.env.HAPI_FHIR_URL ?? "https://hapi.fhir.org/baseR4";
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -1018,16 +1023,69 @@ function errorResponse(message) {
 }
 
 // ---------------------------------------------------------------------------
-// Start
+// Start — dual mode: HTTP/SSE when PORT is set, stdio for local Claude Desktop
 // ---------------------------------------------------------------------------
 
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("FHIR Auto-Fixer MCP server v2.0 started.");
+async function startHttp(port) {
+  const app = express();
+  app.use(cors());
+  app.use(express.json());
+
+  // Health / info endpoint
+  app.get("/", (_req, res) => {
+    res.json({
+      name: "AI-Powered FHIR Auto-Fixer",
+      version: "2.0.0",
+      description: "MCP server that validates broken FHIR resources via HAPI FHIR and auto-fixes them using Claude AI.",
+      hapi_endpoint: HAPI_BASE_URL,
+      mcp_endpoint: "/sse",
+      tools: ["validate_and_fix", "list_profiles", "explain_error", "batch_validate_and_fix"],
+    });
+  });
+
+  // MCP SSE transport — each connection gets its own transport instance
+  const transports = new Map();
+
+  app.get("/sse", async (req, res) => {
+    const transport = new SSEServerTransport("/messages", res);
+    transports.set(transport.sessionId, transport);
+    res.on("close", () => transports.delete(transport.sessionId));
+    await server.connect(transport);
+  });
+
+  app.post("/messages", async (req, res) => {
+    const sessionId = req.query.sessionId;
+    const transport = transports.get(sessionId);
+    if (!transport) {
+      res.status(404).json({ error: "Session not found." });
+      return;
+    }
+    await transport.handlePostMessage(req, res);
+  });
+
+  app.listen(port, () => {
+    console.log(`FHIR Auto-Fixer MCP server v2.0 running on port ${port}`);
+    console.log(`  SSE endpoint : http://localhost:${port}/sse`);
+    console.log(`  HAPI FHIR   : ${HAPI_BASE_URL}`);
+  });
 }
 
-main().catch((err) => {
-  console.error("Fatal error starting MCP server:", err);
-  process.exit(1);
-});
+async function startStdio() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error("FHIR Auto-Fixer MCP server v2.0 started (stdio mode).");
+}
+
+const PORT = process.env.PORT;
+
+if (PORT) {
+  startHttp(parseInt(PORT, 10)).catch((err) => {
+    console.error("Fatal error starting HTTP server:", err);
+    process.exit(1);
+  });
+} else {
+  startStdio().catch((err) => {
+    console.error("Fatal error starting MCP server:", err);
+    process.exit(1);
+  });
+}
