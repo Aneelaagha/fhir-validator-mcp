@@ -11,7 +11,7 @@ confidence scores, report card grades, and clinical explanations.
 - Auto-detects the correct US Core profile based on resource type
 - Uses Claude to generate a fully corrected resource
 - Returns confidence scores on every fix
-- Grades resources A–D before and after fixing
+- Grades resources A-D before and after fixing
 - Explains every fix in both technical and clinical language
 - Supports single resources, Bundles, and batch processing
 
