@@ -1,0 +1,9 @@
+hapi:
+  fhir:
+    fhir_version: R4
+    implementationguides:
+      hl7_fhir_us_core:
+        name: hl7.fhir.us.core
+        version: 6.1.0
+        reloadExisting: false
+        installMode: STORE_AND_INSTALL

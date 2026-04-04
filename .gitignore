@@ -1,0 +1,6 @@
+.env
+node_modules
+hapi-data
+validator_cli.jar
+hapi.application.yaml
+*.log
