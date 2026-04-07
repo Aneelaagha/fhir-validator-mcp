@@ -620,14 +620,14 @@ async function startHttp(port) {
   });
   
 
-  app.post("/messages", async (req, res) => {
+  app.post("/messages", express.json(), async (req, res) => {
     const sessionId = req.query.sessionId;
     const transport = transports.get(sessionId);
     if (!transport) {
       res.status(404).json({ error: "Session not found." });
       return;
     }
-    await transport.handlePostMessage(req, res);
+    await transport.handlePostMessage(req, res, req.body);
   });
 
   app.listen(port, () => {

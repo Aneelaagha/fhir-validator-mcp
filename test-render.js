@@ -1,6 +1,6 @@
+const { EventSource: _namedES, default: _defaultES } = await import("eventsource");
+const EventSourceCtor = _namedES ?? _defaultES?.EventSource ?? _defaultES;
 
-import pkg from "eventsource";
-const EventSourceCtor = pkg.EventSource ?? pkg;
 const BASE_URL = process.env.BASE_URL ?? "https://851756db-af63-44b5-92d4-a0fe75d55d29-00-2e1p61w3w197g.spock.replit.dev";
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS ?? 120000);
 
@@ -59,7 +59,38 @@ async function run() {
   es.onopen = () => console.log("SSE connected");
 
   es.onmessage = async (e) => {
-    console.log("SSE message:", e.data?.substring(0, 300));
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.id === 1 && !initialized) {
+        initialized = true;
+        await post(fetchImpl, { jsonrpc: "2.0", method: "notifications/initialized", params: {} });
+        await post(fetchImpl, {
+          jsonrpc: "2.0", id: 2, method: "tools/call",
+          params: { name: "validate_and_fix", arguments: { resource: JSON.stringify(brokenPatient) } },
+        });
+        console.log("Sent tools/call — waiting for result...");
+        return;
+      }
+      if (msg.id === 2) {
+        const text = msg?.result?.content?.[0]?.text;
+        if (text) {
+          const result = JSON.parse(text);
+          console.log("\n=== RESULT ===");
+          console.log("Success:", result.success);
+          console.log("Fixed passes validation:", result.fixed_passes_validation);
+          console.log("Report card:", result.report_card?.improvement);
+          console.log("Confidence:", result.average_confidence + "%");
+          console.log("Fixes:");
+          for (const f of result.fixes ?? []) {
+            console.log(`  [${f.confidence}%] ${f.field}: "${f.original_value}" -> "${f.corrected_value}"`);
+            if (f.clinical_explanation) console.log(`  Clinical: ${f.clinical_explanation}`);
+          }
+        }
+        safeExit(es, 0);
+      }
+    } catch (err) {
+      console.error("Parse error:", err.message);
+    }
   };
 
   es.addEventListener("endpoint", async (e) => {
