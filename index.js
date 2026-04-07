@@ -252,7 +252,19 @@ const US_CORE_REQUIREMENTS = {
   - occurrenceDateTime or occurrenceString: required`,
 };
 
-async function fixWithClaude(originalResource, issues, profileUrl = null) {
+// ---------------------------------------------------------------------------
+// SHARP context extractor — reads FHIR context headers from Prompt Opinion
+// ---------------------------------------------------------------------------
+function extractFhirContext(request) {
+  const meta = request?.params?._meta ?? {};
+  return {
+    fhirServerUrl: meta["X-FHIR-Server-URL"] ?? null,
+    fhirAccessToken: meta["X-FHIR-Access-Token"] ?? null,
+    patientId: meta["X-Patient-ID"] ?? null,
+  };
+}
+
+async function fixWithClaude(originalResource, issues, profileUrl = null, fhirContext = null) {
   const issueText = issues.map((i, idx) =>
     `Issue ${idx + 1} [${i.severity}/${i.code}]:\n  Message: ${i.diagnostics}\n` +
     (i.location.length ? `  Location: ${i.location.join(", ")}\n` : "")
@@ -264,8 +276,12 @@ async function fixWithClaude(originalResource, issues, profileUrl = null) {
     ? `\n\nIMPORTANT — US CORE PROFILE REQUIREMENTS for ${resourceType}:\n${US_CORE_REQUIREMENTS[resourceType]}\nYou MUST add all missing required fields listed above.`
     : "";
 
+  const fhirContextNote = fhirContext?.patientId
+    ? `\n\nFHIR CONTEXT: This resource belongs to Patient ID: ${fhirContext.patientId}. FHIR server: ${fhirContext.fhirServerUrl ?? "unknown"}.`
+    : "";
+
   const systemPrompt = `You are a FHIR expert who also communicates clearly with clinical staff.
-Your task is to fix broken FHIR resources so they pass HAPI FHIR validation.${usCoreContext}
+Your task is to fix broken FHIR resources so they pass HAPI FHIR validation.${usCoreContext}${fhirContextNote}
 
 RULES:
 1. Return a valid corrected FHIR resource as a JSON object.
@@ -308,7 +324,7 @@ Return ONLY a JSON object with: plain_english, root_cause, fix_example. No markd
   return JSON.parse(jsonText);
 }
 
-async function processOneResource(resourceObj, profile) {
+async function processOneResource(resourceObj, profile, fhirContext = null) {
   const isUsCore = profile && profile.includes("us/core");
   const hapiProfile = isUsCore ? null : (profile ?? null);
 
@@ -361,7 +377,7 @@ async function processOneResource(resourceObj, profile) {
     passCount++;
     let aiResult;
     try {
-      aiResult = await fixWithClaude(currentResource, currentIssues, profile ?? null);
+      aiResult = await fixWithClaude(currentResource, currentIssues, profile ?? null, fhirContext);
     } catch (err) {
       return { success: false, original_issues: issues, error: `AI fix failed on pass ${passCount}: ${err.message}` };
     }
@@ -392,6 +408,8 @@ async function processOneResource(resourceObj, profile) {
     fix_passes_used: passCount,
     us_core_mode: isUsCore,
     jar_validation_used: jarUsed,
+    fhir_context_received: fhirContext?.patientId ? true : false,
+    patient_id: fhirContext?.patientId ?? null,
     report_card: reportCard,
     original_resource: resourceObj,
     fixed_resource: currentResource,
@@ -407,7 +425,7 @@ async function processOneResource(resourceObj, profile) {
   };
 }
 
-async function processBundle(bundleObj, useUsCore) {
+async function processBundle(bundleObj, useUsCore, fhirContext = null) {
   const entries = bundleObj.entry ?? [];
   const fixedBundle = JSON.parse(JSON.stringify(bundleObj));
   const results = [];
@@ -419,7 +437,7 @@ async function processBundle(bundleObj, useUsCore) {
       continue;
     }
     const profile = useUsCore ? US_CORE_PROFILES[resource.resourceType] : undefined;
-    const result = await processOneResource(resource, profile);
+    const result = await processOneResource(resource, profile, fhirContext);
     if (result.success && !result.already_valid && result.fixed_resource) {
       fixedBundle.entry[i] = { ...entry, resource: result.fixed_resource };
     }
@@ -460,14 +478,21 @@ async function fetchSupportedProfiles() {
 
 const server = new Server(
   { name: "fhir-auto-fixer", version: "2.0.0" },
-  { capabilities: { tools: {} } }
+  {
+    capabilities: {
+      tools: {},
+      extensions: {
+        "ai.promptopinion/fhir-context": {}
+      }
+    }
+  }
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "validate_and_fix",
-      description: "Validates a FHIR resource against HAPI FHIR and uses Claude AI to auto-fix it. Returns fixed resource, confidence scores, report card grades, and clinical explanations.",
+      description: "Validates a FHIR resource against HAPI FHIR and uses Claude AI to auto-fix it. Returns fixed resource, confidence scores, report card grades, and clinical explanations. Supports SHARP FHIR context for patient-specific validation.",
       inputSchema: {
         type: "object",
         properties: {
@@ -512,6 +537,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+
+  // Extract FHIR context from Prompt Opinion SHARP headers
+  const fhirContext = extractFhirContext(request);
+  if (fhirContext.patientId) {
+    console.log(`FHIR context received - Patient: ${fhirContext.patientId}, Server: ${fhirContext.fhirServerUrl}`);
+  }
+
   try {
     if (name === "validate_and_fix") {
       const { resource, profile, use_us_core } = ValidateAndFixInput.parse(args);
@@ -519,11 +551,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       try { resourceObj = JSON.parse(resource); } catch { return errorResponse("Invalid JSON."); }
       if (!resourceObj.resourceType) return errorResponse("Missing resourceType field.");
       if (resourceObj.resourceType === "Bundle") {
-        return jsonResponse(await processBundle(resourceObj, use_us_core ?? false));
+        return jsonResponse(await processBundle(resourceObj, use_us_core ?? false, fhirContext));
       }
       const autoDetectedProfile = use_us_core ? US_CORE_PROFILES[resourceObj.resourceType] : undefined;
       const resolvedProfile = profile ?? autoDetectedProfile;
-      const result = await processOneResource(resourceObj, resolvedProfile);
+      const result = await processOneResource(resourceObj, resolvedProfile, fhirContext);
       if (resolvedProfile) {
         result.validated_against_profile = resolvedProfile;
         result.profile_auto_detected = !profile && !!autoDetectedProfile;
@@ -559,7 +591,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           totalFailed++; continue;
         }
         const profile = use_us_core ? US_CORE_PROFILES[resourceObj.resourceType] : undefined;
-        const result = await processOneResource(resourceObj, profile);
+        const result = await processOneResource(resourceObj, profile, fhirContext);
         if (result.success && result.already_valid) totalAlreadyValid++;
         else if (result.success) { totalFixed++; if ((result.low_confidence_fixes ?? []).length > 0) totalLowConfidence++; }
         else totalFailed++;
@@ -596,13 +628,12 @@ function errorResponse(message) {
 async function startHttp(port) {
   const app = express();
   app.use(cors());
-  app.use(express.json());
 
   app.get("/", (_req, res) => {
     res.json({
       name: "AI-Powered FHIR Auto-Fixer",
       version: "2.0.0",
-      description: "MCP server that validates broken FHIR resources via HAPI FHIR and auto-fixes them using Claude AI.",
+      description: "MCP server that validates broken FHIR resources via HAPI FHIR and auto-fixes them using Claude AI. Supports SHARP FHIR context.",
       hapi_endpoint: HAPI_BASE_URL,
       mcp_endpoint: "/sse",
       tools: ["validate_and_fix", "list_profiles", "explain_error", "batch_validate_and_fix"],
@@ -618,7 +649,6 @@ async function startHttp(port) {
     res.on("close", () => transports.delete(transport.sessionId));
     await server.connect(transport);
   });
-  
 
   app.post("/messages", express.json(), async (req, res) => {
     const sessionId = req.query.sessionId;
