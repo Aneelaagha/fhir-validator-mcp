@@ -1051,6 +1051,7 @@ async function startHttp(port) {
   const transports = new Map();
 
   app.get("/sse", async (req, res) => {
+    res.setHeader("X-Accel-Buffering", "no");  // ← this line is new
     const transport = new SSEServerTransport("/messages", res);
     transports.set(transport.sessionId, transport);
     res.on("close", () => transports.delete(transport.sessionId));
