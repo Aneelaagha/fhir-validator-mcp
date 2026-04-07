@@ -16,6 +16,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.0",
+    "eventsource": "^1.1.2",
     "express": "^4.22.1",
     "node-fetch": "^3.3.2",
     "zod": "^3.25.0"
