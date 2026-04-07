@@ -176,16 +176,20 @@ async function validateWithHapi(resourceObj, profile) {
     ? `${HAPI_BASE_URL}/${resourceObj.resourceType}/$validate?profile=${encodeURIComponent(profile)}`
     : `${HAPI_BASE_URL}/${resourceObj.resourceType}/$validate`;
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/fhir+json",
-      Accept: "application/fhir+json",
-    },
-    body: JSON.stringify(resourceObj),
-  });
-
-  return response.json();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 25000);
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/fhir+json", Accept: "application/fhir+json" },
+      body: JSON.stringify(resourceObj),
+      signal: controller.signal,
+    });
+    return response.json();
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('HAPI FHIR timed out after 25s.');
+    throw err;
+  } finally { clearTimeout(timeout); }
 }
 
 function extractIssues(operationOutcome) {
