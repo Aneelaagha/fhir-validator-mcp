@@ -2,6 +2,7 @@ import "dotenv/config";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -252,9 +253,6 @@ const US_CORE_REQUIREMENTS = {
   - occurrenceDateTime or occurrenceString: required`,
 };
 
-// ---------------------------------------------------------------------------
-// SHARP context extractor — reads FHIR context headers from Prompt Opinion
-// ---------------------------------------------------------------------------
 function extractFhirContext(request) {
   const meta = request?.params?._meta ?? {};
   return {
@@ -538,7 +536,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
-  // Extract FHIR context from Prompt Opinion SHARP headers
   const fhirContext = extractFhirContext(request);
   if (fhirContext.patientId) {
     console.log(`FHIR context received - Patient: ${fhirContext.patientId}, Server: ${fhirContext.fhirServerUrl}`);
@@ -635,11 +632,37 @@ async function startHttp(port) {
       version: "2.0.0",
       description: "MCP server that validates broken FHIR resources via HAPI FHIR and auto-fixes them using Claude AI. Supports SHARP FHIR context.",
       hapi_endpoint: HAPI_BASE_URL,
-      mcp_endpoint: "/sse",
+      mcp_endpoint: "/mcp",
+      mcp_sse_endpoint: "/sse",
       tools: ["validate_and_fix", "list_profiles", "explain_error", "batch_validate_and_fix"],
     });
   });
 
+  // Streamable HTTP transport — for Prompt Opinion and modern MCP clients
+  app.post("/mcp", express.json(), async (req, res) => {
+    try {
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+      });
+      res.on("close", () => transport.close());
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+    } catch (err) {
+      if (!res.headersSent) {
+        res.status(500).json({ error: err.message });
+      }
+    }
+  });
+
+  app.get("/mcp", (_req, res) => {
+    res.status(405).json({ error: "Use POST for MCP Streamable HTTP." });
+  });
+
+  app.delete("/mcp", (_req, res) => {
+    res.status(405).json({ error: "Method not allowed." });
+  });
+
+  // SSE transport — legacy support
   const transports = new Map();
 
   app.get("/sse", async (req, res) => {
@@ -662,8 +685,9 @@ async function startHttp(port) {
 
   app.listen(port, () => {
     console.log(`FHIR Auto-Fixer MCP server v2.0 running on port ${port}`);
-    console.log(`  SSE endpoint : http://localhost:${port}/sse`);
-    console.log(`  HAPI FHIR   : ${HAPI_BASE_URL}`);
+    console.log(`  Streamable HTTP : http://localhost:${port}/mcp`);
+    console.log(`  SSE endpoint    : http://localhost:${port}/sse`);
+    console.log(`  HAPI FHIR       : ${HAPI_BASE_URL}`);
   });
 }
 
