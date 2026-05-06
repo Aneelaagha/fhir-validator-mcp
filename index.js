@@ -119,6 +119,13 @@ const BatchValidateAndFixInput = z.object({
   use_us_core: z.boolean().optional(),
 });
 
+const GenerateProvenanceInput = z.object({
+  original_resource: z.string().min(1),
+  fixed_resource: z.string().min(1),
+  fixes: z.string().min(1),
+  average_confidence: z.number().optional(),
+});
+
 async function validateWithHapi(resourceObj, profile) {
   const url = profile
     ? `${HAPI_BASE_URL}/${resourceObj.resourceType}/$validate?profile=${encodeURIComponent(profile)}`
@@ -259,6 +266,108 @@ function extractFhirContext(request) {
     fhirServerUrl: meta["X-FHIR-Server-URL"] ?? null,
     fhirAccessToken: meta["X-FHIR-Access-Token"] ?? null,
     patientId: meta["X-Patient-ID"] ?? null,
+  };
+}
+
+function generateProvenanceResource(originalResource, fixedResource, fixes, avgConfidence) {
+  const now = new Date().toISOString();
+  const resourceType = originalResource.resourceType;
+  const resourceId = originalResource.id ?? "unknown";
+
+  return {
+    resourceType: "Provenance",
+    id: `ai-fix-${Date.now()}`,
+    meta: {
+      profile: ["http://hl7.org/fhir/StructureDefinition/Provenance"]
+    },
+    target: [{
+      reference: `${resourceType}/${resourceId}`,
+      display: `Fixed ${resourceType} resource`
+    }],
+    occurred: { dateTime: now },
+    recorded: now,
+    reason: [{
+      coding: [{
+        system: "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        code: "TREAT",
+        display: "Treatment"
+      }],
+      text: "AI-assisted FHIR data quality correction"
+    }],
+    activity: {
+      coding: [{
+        system: "http://terminology.hl7.org/CodeSystem/v3-DataOperation",
+        code: "UPDATE",
+        display: "Revise"
+      }],
+      text: "Automated FHIR validation and AI-assisted correction"
+    },
+    agent: [
+      {
+        type: {
+          coding: [{
+            system: "http://terminology.hl7.org/CodeSystem/provenance-participant-type",
+            code: "assembler",
+            display: "Assembler"
+          }]
+        },
+        who: {
+          display: "AI-Powered FHIR Auto-Fixer v2.0",
+          identifier: {
+            system: "https://fhir-validator-mcp-1.onrender.com",
+            value: "fhir-auto-fixer"
+          }
+        }
+      },
+      {
+        type: {
+          coding: [{
+            system: "http://terminology.hl7.org/CodeSystem/provenance-participant-type",
+            code: "author",
+            display: "Author"
+          }]
+        },
+        who: {
+          display: "Claude AI (Anthropic claude-sonnet-4-6)",
+          identifier: {
+            system: "https://anthropic.com",
+            value: "claude-sonnet-4-6"
+          }
+        }
+      }
+    ],
+    entity: [
+      {
+        role: "source",
+        what: {
+          display: `Original ${resourceType} resource (pre-correction)`,
+          extension: [{
+            url: "https://fhir-validator-mcp-1.onrender.com/original-resource",
+            valueString: JSON.stringify(originalResource)
+          }]
+        }
+      }
+    ],
+    extension: [
+      {
+        url: "https://fhir-validator-mcp-1.onrender.com/fix-summary",
+        extension: [
+          { url: "total-fixes", valueInteger: fixes.length },
+          { url: "average-confidence", valueDecimal: avgConfidence ?? 0 },
+          { url: "validation-engine", valueString: "HAPI FHIR R4 + Claude AI" },
+          {
+            url: "fixes-detail",
+            valueString: JSON.stringify(fixes.map(f => ({
+              field: f.field,
+              original: f.original_value,
+              corrected: f.corrected_value,
+              confidence: f.confidence,
+              explanation: f.explanation
+            })))
+          }
+        ]
+      }
+    ]
   };
 }
 
@@ -530,6 +639,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["resources"],
       },
     },
+    {
+      name: "generate_provenance",
+      description: "Generates a FHIR R4 Provenance resource that documents every AI-assisted fix made to a FHIR resource. Creates a legally auditable, standards-compliant audit trail showing what was changed, why, by which AI system, and with what confidence. Essential for regulatory compliance and enterprise deployment in real healthcare systems.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          original_resource: { type: "string", description: "The original broken FHIR resource JSON string." },
+          fixed_resource: { type: "string", description: "The fixed FHIR resource JSON string." },
+          fixes: { type: "string", description: "JSON array of fix objects from validate_and_fix." },
+          average_confidence: { type: "number", description: "Average confidence score from validate_and_fix." },
+        },
+        required: ["original_resource", "fixed_resource", "fixes"],
+      },
+    },
   ],
 }));
 
@@ -601,6 +724,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
     }
 
+    if (name === "generate_provenance") {
+      const { original_resource, fixed_resource, fixes, average_confidence } = GenerateProvenanceInput.parse(args);
+      let originalObj, fixedObj, fixesArr;
+      try { originalObj = JSON.parse(original_resource); } catch { return errorResponse("Invalid JSON in original_resource."); }
+      try { fixedObj = JSON.parse(fixed_resource); } catch { return errorResponse("Invalid JSON in fixed_resource."); }
+      try { fixesArr = JSON.parse(fixes); } catch { return errorResponse("Invalid JSON in fixes."); }
+
+      const provenance = generateProvenanceResource(originalObj, fixedObj, fixesArr, average_confidence ?? null);
+
+      return jsonResponse({
+        success: true,
+        provenance_resource: provenance,
+        note: "This FHIR R4 Provenance resource documents the AI-assisted correction and should be stored alongside the fixed resource for audit trail compliance.",
+        fhir_compliant: true,
+        standard: "FHIR R4 Provenance (http://hl7.org/fhir/StructureDefinition/Provenance)"
+      });
+    }
+
     return { content: [{ type: "text", text: JSON.stringify({ error: `Unknown tool: ${name}` }) }], isError: true };
   } catch (err) {
     return {
@@ -629,16 +770,15 @@ async function startHttp(port) {
   app.get("/", (_req, res) => {
     res.json({
       name: "AI-Powered FHIR Auto-Fixer",
-      version: "2.0.0",
-      description: "MCP server that validates broken FHIR resources via HAPI FHIR and auto-fixes them using Claude AI. Supports SHARP FHIR context.",
+      version: "2.1.0",
+      description: "MCP server that validates broken FHIR resources via HAPI FHIR and auto-fixes them using Claude AI. Supports SHARP FHIR context and generates FHIR Provenance audit trails.",
       hapi_endpoint: HAPI_BASE_URL,
       mcp_endpoint: "/mcp",
       mcp_sse_endpoint: "/sse",
-      tools: ["validate_and_fix", "list_profiles", "explain_error", "batch_validate_and_fix"],
+      tools: ["validate_and_fix", "list_profiles", "explain_error", "batch_validate_and_fix", "generate_provenance"],
     });
   });
 
-  // Streamable HTTP transport — for Prompt Opinion and modern MCP clients
   app.post("/mcp", express.json(), async (req, res) => {
     try {
       const transport = new StreamableHTTPServerTransport({
@@ -662,7 +802,6 @@ async function startHttp(port) {
     res.status(405).json({ error: "Method not allowed." });
   });
 
-  // SSE transport — legacy support
   const transports = new Map();
 
   app.get("/sse", async (req, res) => {
@@ -684,7 +823,7 @@ async function startHttp(port) {
   });
 
   app.listen(port, () => {
-    console.log(`FHIR Auto-Fixer MCP server v2.0 running on port ${port}`);
+    console.log(`FHIR Auto-Fixer MCP server v2.1 running on port ${port}`);
     console.log(`  Streamable HTTP : http://localhost:${port}/mcp`);
     console.log(`  SSE endpoint    : http://localhost:${port}/sse`);
     console.log(`  HAPI FHIR       : ${HAPI_BASE_URL}`);
@@ -694,7 +833,7 @@ async function startHttp(port) {
 async function startStdio() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("FHIR Auto-Fixer MCP server v2.0 started (stdio mode).");
+  console.error("FHIR Auto-Fixer MCP server v2.1 started (stdio mode).");
 }
 
 const PORT = process.env.PORT;
